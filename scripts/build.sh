@@ -16,34 +16,40 @@ warn(){ echo -e "${YELLOW}[WARN]${NC} $*"; }
 err(){  echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 setup_clang() {
-  info "Setting up Neutron Clang..."
-  
-  # Define directory for Neutron
-  CLANG_DIR="$HOME/tools/neutron-clang"
-  
-  # Only download if not already present
-  if [ ! -f "$CLANG_DIR/bin/clang" ]; then
+  info "Checking for Clang ($CLANG_VERSION)..."
+  if [ ! -x "$CLANG_BINARY" ]; then
+    warn "Clang not found. Fetching..."
     mkdir -p "$CLANG_DIR"
-    cd "$CLANG_DIR"
-    
-    # Use Antman (Neutron's downloader) to fetch the optimized compiler
-    curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
-    chmod +x antman
-    ./antman -S
-    
-    # Patch for some systems (glibc compatibility)
-    ./antman --patch=glibc
-    
-    cd -
+    TARBALL="$(mktemp)"
+
+    URL_BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive"
+    PRIMARY_URL="$URL_BASE/refs/heads/main/${CLANG_VERSION}.tar.gz"
+    ALT_URL="$URL_BASE/mirror-goog-main-llvm-toolchain-source/${CLANG_VERSION}.tar.gz"
+
+    if command -v wget >/dev/null 2>&1; then
+      DOWN_PRIMARY=(wget -q --show-progress -O "$TARBALL" "$PRIMARY_URL")
+      DOWN_ALT=(wget -q --show-progress -O "$TARBALL" "$ALT_URL")
+    elif command -v curl >/dev/null 2>&1; then
+      DOWN_PRIMARY=(curl -L --fail -o "$TARBALL" "$PRIMARY_URL")
+      DOWN_ALT=(curl -L --fail -o "$TARBALL" "$ALT_URL")
+    else
+      err "Need wget or curl to download the toolchain."
+    fi
+
+    if ! "${DOWN_PRIMARY[@]}"; then
+      warn "Primary URL failed, trying mirror path..."
+      "${DOWN_ALT[@]}" || err "Download failed from both URLs."
+    fi
+
+    info "Extracting toolchain..."
+    tar -xzf "$TARBALL" -C "$CLANG_DIR"
+    rm -f "$TARBALL"
   fi
 
-  # update binary path
-  CLANG_BINARY="$CLANG_DIR/bin/clang"
   export PATH="$CLANG_DIR/bin:$PATH"
-  
-  # Verify version
   ver="$("$CLANG_BINARY" --version | head -n1)"
-  info "Using compiler: $ver"
+  ver="$(echo "$ver" | sed -E 's/\(http[^)]*\)//g; s/[[:space:]]+/ /g; s/[[:space:]]+$//')"
+  export KBUILD_COMPILER_STRING="$ver"
 }
 
 build_kernel() {
@@ -51,24 +57,11 @@ build_kernel() {
   setup_clang
   mkdir -p "$OUT_DIR"
 
-  # 1. CONFIGURATION STEP (Standard)
   make -j"$(nproc --all)" O="$OUT_DIR" ARCH=arm64 CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
        "$KERNEL_DEFCONFIG" || err "defconfig failed"
 
-  # 2. BUILD STEP (The Fix)
-  # - KCFLAGS="-w": Silences warnings so Neutron Clang 19 doesn't crash the build
-  # - Removed "Image.gz": Now builds EVERYTHING (Modules + DTBs + Image)
-  make -j"$(nproc --all)" \
-      O="$OUT_DIR" \
-      ARCH=arm64 \
-      CC=clang \
-      LD=ld.lld \
-      LLVM=1 \
-      LLVM_IAS=1 \
-      CROSS_COMPILE=aarch64-linux-gnu- \
-      CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
-      KCFLAGS="-w -mllvm -polly" \
-      CONFIG_WERROR=n || err "build failed"
+  make -j"$(nproc --all)" O="$OUT_DIR" ARCH=arm64 CC=clang LD=ld.lld LLVM=1 LLVM_IAS=1 \
+       || err "build failed"
 
   total=$(( $(date +%s) - START_TIME ))
   info "Build finished in $((total/60))m $((total%60))s."
